@@ -62,15 +62,21 @@ if [[ -z "$ROOT_OID" ]]; then
   git_err
 fi
 
+# Filter refs below root
+ANY_DESC=0
 ALL_REFS=$(git for-each-ref --format="%(refname) %(objectname)" refs/heads refs/tags)
 while read -r refname refoid; do
   [[ -z "$refname" ]] && continue
-  if ! git merge-base --is-ancestor "$ROOT_OID" "$refoid" 2>/dev/null; then
-    echo "error: ref $refname is not a descendant of root $ROOT_REF ($ROOT_OID)" >&2
-    git_err() { return 1; }
-    git_err
+  if git merge-base --is-ancestor "$ROOT_OID" "$refoid" 2>/dev/null; then
+    ANY_DESC=1
   fi
 done <<< "$ALL_REFS"
+
+if [[ $ANY_DESC -eq 0 ]]; then
+  echo "error: no refs descend from root $ROOT_REF ($ROOT_OID)" >&2
+  git_err() { return 1; }
+  git_err
+fi
 
 python3 - "$ROOT_OID" "$DRY_RUN" "$MOVE_TAGS" "$MAX_ROUNDS" << "PYEOF"
 import sys
@@ -104,7 +110,8 @@ def get_all_refs():
     for line in out.splitlines():
         if line:
             rname, roid = line.split()
-            refs[rname] = roid
+            if is_ancestor(root_oid, roid):
+                refs[rname] = roid
     return refs
 
 initial_refs = get_all_refs()
@@ -113,9 +120,10 @@ initial_tags = {r: oid for r, oid in initial_refs.items() if r.startswith("refs/
 def get_reachable_commits():
     out = run_cmd(["git", "for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags"])
     refnames = [r for r in out.splitlines() if r and not r.startswith("refs/heads/gto-tag-tmp/")]
-    if not refnames:
+    valid_refs = [r for r in refnames if is_ancestor(root_oid, run_cmd(["git", "rev-parse", "--verify", r]))]
+    if not valid_refs:
         return []
-    revs = run_cmd(["git", "rev-list", "--topo-order"] + refnames + ["^" + root_oid])
+    revs = run_cmd(["git", "rev-list", "--topo-order"] + valid_refs + ["^" + root_oid])
     commits = [c for c in revs.splitlines() if c]
     if root_oid not in commits:
         commits.insert(0, root_oid)
@@ -193,9 +201,10 @@ while True:
     for line in run_cmd(["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]).splitlines():
         if line:
             rname, roid = line.split()
-            if roid not in head_refs:
-                head_refs[roid] = []
-            head_refs[roid].append(rname)
+            if is_ancestor(root_oid, roid):
+                if roid not in head_refs:
+                    head_refs[roid] = []
+                head_refs[roid].append(rname)
 
     added_temp = False
     for thash, members in tree_groups.items():
@@ -236,7 +245,7 @@ while True:
                     if not bline:
                         continue
                     rname, roid = bline.split()
-                    if rname.startswith("refs/heads/gto-keep/"):
+                    if rname.startswith("refs/heads/gto-keep/") or not is_ancestor(root_oid, roid):
                         continue
                     if is_ancestor(c_prime, roid):
                         keep_ref = f"refs/heads/gto-keep/{c_prime}"
@@ -272,7 +281,7 @@ while True:
                     if not bline:
                         continue
                     rname, roid = bline.split()
-                    if rname.startswith("refs/heads/gto-keep/"):
+                    if rname.startswith("refs/heads/gto-keep/") or not is_ancestor(root_oid, roid):
                         continue
                     if is_ancestor(Y, roid):
                         keep_ref = f"refs/heads/gto-keep/{Y}"

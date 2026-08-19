@@ -214,13 +214,16 @@ pub fn optimize_history(
     };
     let root_oid = root_obj.id();
 
-    // Pre-flight check 2: all local refs must descend from root
-    let all_refs = get_all_local_refs_git2(raw_repo)?;
-    for (refname, &refoid) in &all_refs {
-        if !is_ancestor_git2(raw_repo, root_oid, refoid) {
-            eprintln!("error: ref {refname} is not a descendant of root {root_ref_str} ({root_oid})");
-            return Ok(Err(ExitCode(1)));
-        }
+    // Filter local refs to only those that descend from root_oid
+    let raw_all_refs = get_all_local_refs_git2(raw_repo)?;
+    let all_refs: BTreeMap<String, Oid> = raw_all_refs
+        .into_iter()
+        .filter(|(_, refoid)| is_ancestor_git2(raw_repo, root_oid, *refoid))
+        .collect();
+
+    if all_refs.is_empty() {
+        eprintln!("error: no local refs descend from root {root_ref_str} ({root_oid})");
+        return Ok(Err(ExitCode(1)));
     }
 
     let mut depth_cache = HashMap::new();

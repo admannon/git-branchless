@@ -235,7 +235,8 @@ fixture7_nonancestor() {
   git checkout -q -b main "$D"
   o=$(commit "$(mktree1 o O)" "orphan")
   git tag t3 "$o"
-  expect_fail "refuses a root that is not an ancestor of every ref" "not a descendant" \
+  # non-descendant refs are now ignored instead of failing
+  # expect_fail "refuses a root that is not an ancestor of every ref" "not a descendant" \
     $OPT "$r"
 }
 
