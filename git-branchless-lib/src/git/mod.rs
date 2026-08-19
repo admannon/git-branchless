@@ -37,3 +37,5 @@ pub use test::{
 pub use tree::{
     Tree, dehydrate_tree, get_changed_paths_between_trees, hydrate_tree, make_empty_tree,
 };
+
+pub use git2;

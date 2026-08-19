@@ -474,6 +474,11 @@ impl std::fmt::Debug for Repo {
 }
 
 impl Repo {
+    /// Get access to the underlying `git2::Repository`.
+    pub fn raw_repo(&self) -> &git2::Repository {
+        &self.inner
+    }
+
     /// Get the Git repository associated with the given directory.
     #[instrument]
     pub fn from_dir(path: &Path) -> Result<Self> {

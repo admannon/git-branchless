@@ -470,6 +470,30 @@ pub struct TestArgs {
 /// FIXME: write man-page text
 #[derive(Debug, Parser)]
 pub enum Command {
+    /// Sub-tree history optimization algorithm.
+    #[clap(name = "optimize-history")]
+    OptimizeHistory {
+        /// Root commit base for history optimization.
+        #[clap(short = 'b', long = "base")]
+        base: Option<Revset>,
+
+        /// Positional root commit argument.
+        #[clap(value_parser)]
+        root: Option<Revset>,
+
+        /// Do not apply changes; print plan only.
+        #[clap(short = 'n', long = "dry-run")]
+        dry_run: bool,
+
+        /// Move tags pointing to duplicates.
+        #[clap(long = "move-tags")]
+        move_tags: bool,
+
+        /// Maximum rounds of alternation (0 for unlimited).
+        #[clap(long = "max-rounds")]
+        max_rounds: Option<usize>,
+    },
+
     /// Amend the current HEAD commit.
     Amend {
         /// Options for moving commits.

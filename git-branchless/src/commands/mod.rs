@@ -8,6 +8,7 @@ mod restack;
 mod snapshot;
 mod split;
 mod sync;
+mod optimize_history;
 mod wrap;
 
 use git_branchless_invoke::CommandContext;
@@ -33,6 +34,22 @@ fn command_main(ctx: CommandContext, opts: Opts) -> EyreExitOr<()> {
     } = opts;
 
     let exit_code = match command {
+                Command::OptimizeHistory {
+            base,
+            root,
+            dry_run,
+            move_tags,
+            max_rounds,
+        } => optimize_history::optimize_history(
+            &effects,
+            &git_run_info,
+            base,
+            root,
+            dry_run,
+            move_tags,
+            max_rounds,
+        )?,
+
         Command::Amend {
             move_options,
             untracked_file_strategy,
