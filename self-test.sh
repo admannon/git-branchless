@@ -340,10 +340,76 @@ fixture11_zip() {
   common_asserts "$A"
 }
 
+# Deterministic cdate for fixtures that must not depend on same-second
+# timestamp tiebreaks: author/committer dates are forced per commit.
+commit_at() {
+  local t=$1 m=$2 d=$3
+  shift 3
+  local -a args=()
+  local p
+  for p in "$@"; do args+=(-p "$p"); done
+  printf "%s\n" "$m" | GIT_AUTHOR_DATE="$d" GIT_COMMITTER_DATE="$d" git commit-tree "$t" "${args[@]}"
+}
+
+fixture12_zip100() {
+  echo "fixture 12: alternating cross-zip (100 parallel levels)"
+  local d A B D out trees_before
+  local -a b1 b2
+  d=$(newrepo); cd "$d"
+  A=$(commit_at "$(mktree1 r R)" "A" "@1700000000 +0000")
+  b1[0]=$A
+  b2[0]=$A
+  local i
+  for i in $(seq 1 100); do
+    b1[$i]=$(commit_at "$(mktree1 t$i L$i)" "t$i" "@$((1700000100 + i)) +0000" "${b1[$((i-1))]}")
+    b2[$i]=$(commit_at "$(mktree1 t$i L$i)" "t$i'" "@$((1700001100 + i)) +0000" "${b2[$((i-1))]}")
+  done
+  B=$(commit_at "$(mktree1 fB B)" "B" "@1700009998 +0000" "${b1[100]}")
+  D=$(commit_at "$(mktree1 fD D)" "D" "@1700009999 +0000" "${b2[100]}")
+  git checkout -q -b branch1 "$B"
+  git checkout -q -b branch2 "$D"
+  git checkout -q branch1
+
+  trees_before=$(tree_set "$A")
+  out=$($OPT "$A" 2>&1) || die "fixture 12 optimize failed"
+  check "zip100: exactly 1 real rebase" test "$(printf "%s\n" "$out" | grep -cE 'Pass [0-9]+ \(pass [0-9]+\): (rebasing|shallowing) refs/heads/branch2')" = 1
+  check "zip100: exactly 2 rounds" test "$(printf "%s\n" "$out" | grep -c '^Round [0-9]*:')" = 2
+  check "zip100: branch1 tip tree preserved" test "$(git rev-parse "branch1^{tree}")" = "$(git rev-parse "$B^{tree}")"
+  check "zip100: branch2 tip tree preserved" test "$(git rev-parse "branch2^{tree}")" = "$(git rev-parse "$D^{tree}")"
+  check "zip100: branch2 now branches from canonical t100 (branch1 line)" is_ancestor "${b1[100]}" "$(git rev-parse branch2)"
+  common_asserts "$A"
+}
+
+fixture13_merge() {
+  echo "fixture 13: merge commit on the duplicate line"
+  local d A c1 c2 c3 B c1p c2p c3p D out trees_before
+  d=$(newrepo); cd "$d"
+  A=$(commit_at "$(mktree1 r R)" "A" "@1700000000 +0000")
+  c1=$(commit_at "$(mktree1 f1 C1)" "c1" "@1700000101 +0000" "$A")
+  c2=$(commit_at "$(mktree1 f2 C2)" "c2" "@1700000102 +0000" "$c1")
+  c3=$(commit_at "$(mktree1 f3 C3)" "c3" "@1700000103 +0000" "$c2")
+  B=$(commit_at "$(mktree1 fB B)" "B" "@1700000104 +0000" "$c3")
+  c1p=$(commit_at "$(mktree1 f1 C1)" "c1'" "@1700000201 +0000" "$A")
+  c2p=$(commit_at "$(mktree1 f2 C2)" "c2'" "@1700000202 +0000" "$c1p")
+  c3p=$(commit_at "$(mktree1 f3 C3)" "c3'" "@1700000203 +0000" "$c2p")
+  D=$(commit_at "$(mktree1 fD D)" "D" "@1700000300 +0000" "$c3" "$c3p")
+  git checkout -q -b branch1 "$B"
+  git checkout -q -b branch2 "$D"
+
+  trees_before=$(tree_set "$A")
+  out=$($OPT "$A" --max-rounds 8 2>&1) || die "fixture 13 optimize failed"
+  check "merge: converges (fixpoint reached)" printf "%s\n" "$out" | grep -q "Fixpoint reached"
+  check "merge: branch2 tip tree preserved" test "$(git rev-parse "branch2^{tree}")" = "$(git rev-parse "$D^{tree}")"
+  check "merge: branch2 now branches from canonical c3" is_ancestor "$c3" "$(git rev-parse branch2)"
+  check "merge: exactly 2 real rebases (1 pattern-1 + 1 pattern-2)" test "$(printf "%s\n" "$out" | grep -cE 'Pass [0-9]+ \(pass [0-9]+\): (rebasing|shallowing) refs/heads/branch2')" = 2
+  common_asserts "$A"
+}
+
 for f in \
   fixture1_pattern1 fixture2_pattern2 fixture3_consecutive fixture4_tipdup \
   fixture5_tags fixture6_dirty fixture7_nonancestor fixture8_dryrun \
-  fixture9_rootdup fixture10_combined fixture11_zip; do
+  fixture9_rootdup fixture10_combined fixture11_zip fixture12_zip100 \
+  fixture13_merge; do
   "$f" || die "fixture $f failed"
 done
 

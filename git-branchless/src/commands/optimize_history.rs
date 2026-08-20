@@ -147,21 +147,24 @@ impl InMemoryGraph {
     }
 
     /// True iff `a` is an ancestor of (or equal to) `b`.
+    ///
+    /// Walks up from `b` through its parents, which is bounded by the depth of
+    /// `b` instead of the size of `a`'s whole subtree.
     fn is_ancestor(&self, a: Oid, b: Oid) -> bool {
         if a == b {
             return true;
         }
-        let mut stack = vec![a];
+        let mut stack = vec![b];
         let mut seen = HashSet::new();
         while let Some(n) = stack.pop() {
-            if n == b {
+            if n == a {
                 return true;
             }
-            if !seen.insert(n) {
+            if n == self.root_oid || !seen.insert(n) {
                 continue;
             }
             if let Some(node) = self.nodes.get(&n) {
-                stack.extend(node.children.iter().copied());
+                stack.extend(node.parents.iter().copied());
             }
         }
         false
@@ -189,16 +192,32 @@ impl InMemoryGraph {
     }
 
     /// Post-order (parents first) ancestor walk from `n`, excluding the root.
+    ///
+    /// Iterative so that deep histories cannot overflow the stack; `seen` is
+    /// shared across tips so each commit is walked and emitted exactly once.
     fn collect_ancestors(&self, n: Oid, seen: &mut HashSet<Oid>, out: &mut Vec<Oid>) {
-        if n == self.root_oid || !seen.insert(n) {
+        if n == self.root_oid {
             return;
         }
-        if let Some(node) = self.nodes.get(&n) {
-            for &p in &node.parents {
-                self.collect_ancestors(p, seen, out);
+        let mut stack: Vec<(Oid, bool)> = vec![(n, false)];
+        while let Some((x, expanded)) = stack.pop() {
+            if x == self.root_oid {
+                continue;
+            }
+            if expanded {
+                out.push(x);
+                continue;
+            }
+            if !seen.insert(x) {
+                continue;
+            }
+            stack.push((x, true));
+            if let Some(node) = self.nodes.get(&x) {
+                for &p in node.parents.iter().rev() {
+                    stack.push((p, false));
+                }
             }
         }
-        out.push(n);
     }
 
     /// Commits reachable from branch refs (tags and gto-tag-tmp excluded),
@@ -265,17 +284,45 @@ impl InMemoryGraph {
     ) {
         let target = self.refs[refname];
 
-        let mut seen = HashSet::new();
-        let mut anc_a = Vec::new();
-        self.collect_ancestors(target, &mut seen, &mut anc_a);
-        let set_a: HashSet<Oid> = anc_a.into_iter().collect();
+        // Proper ancestors of old_base (excluding old_base itself and the
+        // root): everything a replayed commit must not be.
+        let mut anc_old = HashSet::new();
+        {
+            let mut seen = HashSet::new();
+            let mut stack = vec![old_base];
+            while let Some(x) = stack.pop() {
+                if x == self.root_oid || !seen.insert(x) {
+                    continue;
+                }
+                if let Some(node) = self.nodes.get(&x) {
+                    for &p in &node.parents {
+                        anc_old.insert(p);
+                        stack.push(p);
+                    }
+                }
+            }
+        }
 
-        let mut seen = HashSet::new();
-        let mut anc_b = Vec::new();
-        self.collect_ancestors(old_base, &mut seen, &mut anc_b);
-        let set_b: HashSet<Oid> = anc_b.into_iter().collect();
-
-        let mut revs: Vec<Oid> = set_a.difference(&set_b).copied().collect();
+        // Commits strictly between old_base and the ref tip: ancestors(target)
+        // minus ancestors(old_base) minus {old_base}. Pruned during the walk,
+        // so the cost is bounded by the replay set, not the whole graph.
+        let mut revs = Vec::new();
+        {
+            let mut seen = HashSet::new();
+            let mut stack = vec![target];
+            while let Some(x) = stack.pop() {
+                if x == self.root_oid || x == old_base || anc_old.contains(&x) {
+                    continue;
+                }
+                if !seen.insert(x) {
+                    continue;
+                }
+                revs.push(x);
+                if let Some(node) = self.nodes.get(&x) {
+                    stack.extend(node.parents.iter().copied());
+                }
+            }
+        }
         revs.sort_by_key(|r| self.nodes[r].depth);
 
         let mut curr_parent = new_base;
@@ -307,6 +354,38 @@ impl InMemoryGraph {
             curr_parent = v;
         }
         self.refs.insert(refname.to_string(), curr_parent);
+    }
+
+    /// Commit -> branches (ref name, tip) whose ancestry contains it, for
+    /// non-temp branch refs only. Builds once per pass in O(branches * depth)
+    /// so that per-dup branch lookups become O(1) instead of rescanning every
+    /// branch against every duplicate commit.
+    fn descending_branches(&self) -> HashMap<Oid, Vec<(String, Oid)>> {
+        let mut map: HashMap<Oid, Vec<(String, Oid)>> = HashMap::new();
+        let branch_refs: Vec<(String, Oid)> = self
+            .refs
+            .iter()
+            .filter(|(rname, _)| {
+                rname.starts_with("refs/heads/")
+                    && !rname.starts_with("refs/heads/gto-keep/")
+                    && !rname.starts_with("refs/heads/gto/")
+            })
+            .map(|(r, &o)| (r.clone(), o))
+            .collect();
+        for (rname, tip) in branch_refs {
+            let mut seen = HashSet::new();
+            let mut stack = vec![tip];
+            while let Some(n) = stack.pop() {
+                if n == self.root_oid || !seen.insert(n) {
+                    continue;
+                }
+                map.entry(n).or_default().push((rname.clone(), tip));
+                if let Some(node) = self.nodes.get(&n) {
+                    stack.extend(node.parents.iter().copied());
+                }
+            }
+        }
+        map
     }
 }
 
@@ -471,14 +550,13 @@ pub fn optimize_history(
             return Ok(Err(ExitCode(1)));
         }
 
-        let commits = graph.reachable();
-        let proc_commits: Vec<Oid> = commits.into_iter().filter(|&c| c != root_oid).collect();
+        let reachable = graph.reachable();
+        let proc_commits: Vec<Oid> = reachable.iter().copied().filter(|&c| c != root_oid).collect();
         if proc_commits.is_empty() {
             println!("No reachable commits to optimize.");
             break;
         }
 
-        let reachable = graph.reachable();
         let (round_cans, tree_groups) = graph.select_canonicals(&reachable);
 
         // Step 0: branch the duplicates that lack a branch ref
@@ -519,6 +597,8 @@ pub fn optimize_history(
             let mut p1_changed = false;
             let current_commits = graph.reachable();
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
+            let descending = graph.descending_branches();
+            let mut rebased_this_pass: HashSet<String> = HashSet::new();
 
             for &c_prime in &proc_c {
                 let Some(&canonical_c) = round_cans.get(&c_prime) else {
@@ -534,24 +614,15 @@ pub fn optimize_history(
                     }
                     plan_actions.push(format!("Pattern 1: preserve chain {keep_ref} at {c_prime}"));
 
-                    let branch_refs: Vec<(String, Oid)> = graph
-                        .refs
-                        .iter()
-                        .filter(|(rname, _)| {
-                            rname.starts_with("refs/heads/")
-                                && !rname.starts_with("refs/heads/gto-keep/")
-                                && !rname.starts_with("refs/heads/gto/")
-                        })
-                        .map(|(r, &o)| (r.clone(), o))
-                        .collect();
-                    for (rname, roid) in &branch_refs {
-                        if graph.is_ancestor(c_prime, *roid) {
-                            if c_prime != *roid {
+                    if let Some(branch_list) = descending.get(&c_prime) {
+                        for (rname, roid) in branch_list {
+                            if c_prime != *roid && !rebased_this_pass.contains(rname) {
                                 println!("Round {round_num} Pass 1 (pass {p1_pass}): rebasing {rname} onto canonical {canonical_c}");
                                 plan_actions.push(format!("Pattern 1: rebase {rname} onto {canonical_c} (from {c_prime})"));
 
                                 if !dry_run {
                                     graph.virtual_rebase(rname, c_prime, canonical_c, &mut old_to_new);
+                                    rebased_this_pass.insert(rname.clone());
                                     p1_changed = true;
                                     changed_in_round = true;
                                 }
@@ -572,6 +643,8 @@ pub fn optimize_history(
             let mut p2_changed = false;
             let current_commits = graph.reachable();
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
+            let descending = graph.descending_branches();
+            let mut rebased_this_pass: HashSet<String> = HashSet::new();
 
             for &y in &proc_c {
                 let Some(&canonical_c) = round_cans.get(&y) else {
@@ -587,24 +660,15 @@ pub fn optimize_history(
                     }
                     plan_actions.push(format!("Pattern 2: preserve chain {keep_ref} at {y}"));
 
-                    let branch_refs: Vec<(String, Oid)> = graph
-                        .refs
-                        .iter()
-                        .filter(|(rname, _)| {
-                            rname.starts_with("refs/heads/")
-                                && !rname.starts_with("refs/heads/gto-keep/")
-                                && !rname.starts_with("refs/heads/gto/")
-                        })
-                        .map(|(r, &o)| (r.clone(), o))
-                        .collect();
-                    for (rname, roid) in &branch_refs {
-                        if graph.is_ancestor(y, *roid) {
-                            if y != *roid {
+                    if let Some(branch_list) = descending.get(&y) {
+                        for (rname, roid) in branch_list {
+                            if y != *roid && !rebased_this_pass.contains(rname) {
                                 println!("Round {round_num} Pass 2 (pass {p2_pass}): shallowing {rname} onto canonical {canonical_c}");
                                 plan_actions.push(format!("Pattern 2: rebase {rname} onto {canonical_c} (from {y})"));
 
                                 if !dry_run {
                                     graph.virtual_rebase(rname, y, canonical_c, &mut old_to_new);
+                                    rebased_this_pass.insert(rname.clone());
                                     p2_changed = true;
                                     changed_in_round = true;
                                 }
