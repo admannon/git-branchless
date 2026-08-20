@@ -51,7 +51,7 @@ fn get_reachable_commits_git2(
     revwalk.set_sorting(Sort::TOPOLOGICAL)?;
 
     for name in refs.keys() {
-        if !name.starts_with("refs/heads/gto-tag-tmp/") {
+        if !name.starts_with("refs/heads/gto-tag-tmp/") && !name.starts_with("refs/tags/") {
             revwalk.push_ref(name)?;
         }
     }
@@ -142,6 +142,7 @@ fn rebase_branch_onto_git2(
     target_branch_ref: &str,
     old_base_oid: Oid,
     new_base_oid: Oid,
+    old_to_new: &mut HashMap<Oid, Oid>,
 ) -> Result<(), git2::Error> {
     let target_oid = raw_repo
         .find_reference(target_branch_ref)?
@@ -172,6 +173,7 @@ fn rebase_branch_onto_git2(
             &tree,
             &[&parent_commit],
         )?;
+        old_to_new.insert(r_oid, curr_parent_oid);
     }
 
     raw_repo.reference(target_branch_ref, curr_parent_oid, true, "rebase_branch_onto")?;
@@ -261,6 +263,7 @@ pub fn optimize_history(
 
     let max_rounds_num = max_rounds.unwrap_or(0);
     let mut plan_actions = Vec::new();
+    let mut old_to_new = HashMap::new();
 
     let mut round_num = 0;
     loop {
@@ -284,7 +287,7 @@ pub fn optimize_history(
         }
 
         let reachable = get_reachable_commits_git2(raw_repo, root_oid)?;
-        let (_canonicals, tree_groups) = select_canonicals_git2(raw_repo, &reachable, root_oid, &mut depth_cache)?;
+        let (round_cans, tree_groups) = select_canonicals_git2(raw_repo, &reachable, root_oid, &mut depth_cache)?;
 
         // Step 0: branch the duplicates that lack a branch ref
         let current_refs = get_all_local_refs_git2(raw_repo)?;
@@ -308,9 +311,9 @@ pub fn optimize_history(
                         if !dry_run {
                             let commit_obj = raw_repo.find_commit(m)?;
                             let _ = raw_repo.branch(&format!("gto/{m}"), &commit_obj, false);
+                            added_temp = true;
                         }
                         plan_actions.push(format!("Step 0: create temp branch {temp_ref} for {m}"));
-                        added_temp = true;
                         head_refs.entry(m).or_default().push(temp_ref);
                     }
                 }
@@ -326,10 +329,11 @@ pub fn optimize_history(
             let mut p1_changed = false;
             let current_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
-            let (cans, _) = select_canonicals_git2(raw_repo, &get_reachable_commits_git2(raw_repo, root_oid)?, root_oid, &mut depth_cache)?;
 
             for &c_prime in &proc_c {
-                let canonical_c = cans[&c_prime];
+                let Some(&canonical_c) = round_cans.get(&c_prime) else {
+                    continue;
+                };
                 if c_prime == canonical_c {
                     continue;
                 }
@@ -343,7 +347,10 @@ pub fn optimize_history(
 
                     let branch_refs = get_all_local_refs_git2(raw_repo)?;
                     for (rname, &roid) in &branch_refs {
-                        if !rname.starts_with("refs/heads/") || rname.starts_with("refs/heads/gto-keep/") {
+                        if !rname.starts_with("refs/heads/")
+                            || rname.starts_with("refs/heads/gto-keep/")
+                            || rname.starts_with("refs/heads/gto/")
+                        {
                             continue;
                         }
                         if is_ancestor_git2(raw_repo, c_prime, roid) {
@@ -352,11 +359,11 @@ pub fn optimize_history(
                                 plan_actions.push(format!("Pattern 1: rebase {rname} onto {canonical_c} (from {c_prime})"));
 
                                 if !dry_run {
-                                    let _ = rebase_branch_onto_git2(raw_repo, rname, c_prime, canonical_c);
+                                    let _ = rebase_branch_onto_git2(raw_repo, rname, c_prime, canonical_c, &mut old_to_new);
+                                    p1_changed = true;
+                                    changed_in_round = true;
                                 }
                             }
-                            p1_changed = true;
-                            changed_in_round = true;
                         }
                     }
                 }
@@ -373,10 +380,11 @@ pub fn optimize_history(
             let mut p2_changed = false;
             let current_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
-            let (cans, _) = select_canonicals_git2(raw_repo, &get_reachable_commits_git2(raw_repo, root_oid)?, root_oid, &mut depth_cache)?;
 
             for &y in &proc_c {
-                let canonical_c = cans[&y];
+                let Some(&canonical_c) = round_cans.get(&y) else {
+                    continue;
+                };
                 if y == canonical_c {
                     continue;
                 }
@@ -390,7 +398,10 @@ pub fn optimize_history(
 
                     let branch_refs = get_all_local_refs_git2(raw_repo)?;
                     for (rname, &roid) in &branch_refs {
-                        if !rname.starts_with("refs/heads/") || rname.starts_with("refs/heads/gto-keep/") {
+                        if !rname.starts_with("refs/heads/")
+                            || rname.starts_with("refs/heads/gto-keep/")
+                            || rname.starts_with("refs/heads/gto/")
+                        {
                             continue;
                         }
                         if is_ancestor_git2(raw_repo, y, roid) {
@@ -399,11 +410,11 @@ pub fn optimize_history(
                                 plan_actions.push(format!("Pattern 2: rebase {rname} onto {canonical_c} (from {y})"));
 
                                 if !dry_run {
-                                    let _ = rebase_branch_onto_git2(raw_repo, rname, y, canonical_c);
+                                    let _ = rebase_branch_onto_git2(raw_repo, rname, y, canonical_c, &mut old_to_new);
+                                    p2_changed = true;
+                                    changed_in_round = true;
                                 }
                             }
-                            p2_changed = true;
-                            changed_in_round = true;
                         }
                     }
                 }
@@ -425,9 +436,21 @@ pub fn optimize_history(
             println!("Updating tags to point to canonical commits...");
             for (tag_ref, &tag_oid) in &initial_tags {
                 let tname = tag_ref.trim_start_matches("refs/tags/");
-                if let Some(&new_target) = dup_targets.get(&tag_oid) {
-                    let _ = raw_repo.tag_lightweight(tname, &raw_repo.find_object(new_target, None)?, true);
+                let mut cur = tag_oid;
+                while let Some(&next) = old_to_new.get(&cur) {
+                    if next == cur {
+                        break;
+                    }
+                    cur = next;
                 }
+                let final_target = if cur != tag_oid {
+                    cur
+                } else if let Some(&dt) = dup_targets.get(&tag_oid) {
+                    dt
+                } else {
+                    continue;
+                };
+                let _ = raw_repo.tag_lightweight(tname, &raw_repo.find_object(final_target, None)?, true);
             }
         } else {
             for (tag_ref, &tag_oid) in &initial_tags {

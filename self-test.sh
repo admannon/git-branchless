@@ -104,7 +104,7 @@ fixture1_pattern1() {
   check "line tip now descends from canonical C" is_ancestor "$C" "$(git rev-parse line)"
   check "line tip tree preserved" test "$(git rev-parse "line^{tree}")" = "$(git rev-parse "$U^{tree}")"
   check "kept side line anchored (gto-keep/<C' parent == c3)" \
-    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && return 0; done; return 1' _ "$c3"
+    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && exit 0; done; exit 1' _ "$c3"
   common_asserts "$r"
 }
 
@@ -124,7 +124,7 @@ fixture2_pattern2() {
   check "tip now descends from canonical C" is_ancestor "$C" "$(git rev-parse b)"
   check "tip tree preserved" test "$(git rev-parse "b^{tree}")" = "$(git rev-parse "$B^{tree}")"
   check "kept chain anchored (gto-keep/<Y> parent == c5)" \
-    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && return 0; done; return 1' _ "$c5"
+    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && exit 0; done; exit 1' _ "$c5"
   common_asserts "$r"
 }
 
@@ -183,10 +183,11 @@ fixture5_tags() {
   git tag t1 "$U"
   git tag t2 "$Cp"
   git checkout -q main
+  trees_before=$(tree_set "$r")
   out=$($OPT "$r")
   check "duplicate-target tag left in place by default" test "$(git rev-parse t2)" = "$Cp"
   check "unique-target tag untouched" test "$(git rev-parse t1)" = "$U"
-  check "tag is reported" bash -c "echo "\$out" | grep -q 'refs/tags/t2 left'"
+  check "tag is reported" bash -c "echo "$out" | grep -q 'refs/tags/t2 left'"
   common_asserts "$r"
 
   d=$(newrepo); cd "$d"
@@ -204,6 +205,7 @@ fixture5_tags() {
   git tag t1 "$U"
   git tag t2 "$Cp"
   git checkout -q main
+  trees_before=$(tree_set "$r")
   $OPT "$r" --move-tags >/dev/null
   check "--move-tags repoints duplicate-target tag to canonical" test "$(git rev-parse t2)" = "$C"
   check "--move-tags repoints duplicate-target tag t1 to the canonical-line replay" test "$(git rev-parse t1)" = "$(git rev-parse line)"
@@ -256,8 +258,9 @@ fixture8_dryrun() {
   git checkout -q -b main "$D"
   git checkout -q -b line "$U"
   git checkout -q main
+  trees_before=$(tree_set "$r")
   out=$($OPT "$r" --dry-run)
-  check "dry-run prints the rebase plan" bash -c "echo "\$out" | grep -q 'plan:'"
+  check "dry-run prints the rebase plan" bash -c "echo "$out" | grep -q 'plan:'"
   check "dry-run leaves main untouched" test "$(git rev-parse main)" = "$D"
   check "dry-run leaves line untouched" test "$(git rev-parse line)" = "$U"
   check "dry-run creates no branches" test -z "$(git for-each-ref --format='%(refname)' refs/heads/gto)"
@@ -300,9 +303,9 @@ fixture10_combined() {
   check "main tree preserved" test "$(git rev-parse "main^{tree}")" = "$(git rev-parse "$D^{tree}")"
   check "line tree preserved" test "$(git rev-parse "line^{tree}")" = "$(git rev-parse "$U^{tree}")"
   check "kept chain for Y anchored (parent == C)" \
-    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && return 0; done; return 1' _ "$C"
+    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && exit 0; done; exit 1' _ "$C"
   check "kept chain for Z anchored (parent == R)" \
-    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && return 0; done; return 1' _ "$r"
+    bash -c 'for rr in $(git for-each-ref --format="%(refname)" refs/heads/gto-keep); do git rev-parse "$rr^" | grep -qx "$(git rev-parse "$1")" && exit 0; done; exit 1' _ "$r"
   common_asserts "$r"
 }
 
@@ -336,3 +339,13 @@ fixture11_zip() {
   check "branch2 now branches from c3 (canonical cn)" is_ancestor "$c3" "$(git rev-parse branch2)"
   common_asserts "$A"
 }
+
+for f in \
+  fixture1_pattern1 fixture2_pattern2 fixture3_consecutive fixture4_tipdup \
+  fixture5_tags fixture6_dirty fixture7_nonancestor fixture8_dryrun \
+  fixture9_rootdup fixture10_combined fixture11_zip; do
+  "$f" || die "fixture $f failed"
+done
+
+echo "suite: PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ]
