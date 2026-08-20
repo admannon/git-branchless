@@ -1,9 +1,11 @@
 //! Implementation of `git branchless optimize-history` natively using `git2` and `lib::git::Repo`.
+//!
+//! The whole commit graph is loaded into RAM once. All rounds, patterns, and
+//! rebase decisions run against the in-memory graph, producing only virtual
+//! commits. Disk writes are deferred to a single topologically-ordered
+//! materialization pass at the very end (and skipped entirely for `--dry-run`).
 
-use std::collections::{BTreeMap, HashMap};
-
-
-
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use git_branchless_opts::Revset;
 use lib::core::effects::Effects;
@@ -11,14 +13,8 @@ use lib::git::git2::{Oid, Sort};
 use lib::git::{git2, GitRunInfo, Repo};
 use lib::util::{ExitCode, EyreExitOr};
 
-fn is_ancestor_git2(raw_repo: &git2::Repository, a: Oid, b: Oid) -> bool {
-    if a == b {
-        return true;
-    }
-    raw_repo.graph_descendant_of(b, a).unwrap_or(false)
-}
-
-fn get_all_local_refs_git2(
+/// Load every local branch and tag ref as a name -> commit oid map.
+fn load_all_local_refs(
     raw_repo: &git2::Repository,
 ) -> Result<BTreeMap<String, Oid>, git2::Error> {
     let mut map = BTreeMap::new();
@@ -38,145 +34,346 @@ fn get_all_local_refs_git2(
     Ok(map)
 }
 
-fn get_reachable_commits_git2(
-    raw_repo: &git2::Repository,
-    root_oid: Oid,
-) -> Result<Vec<Oid>, git2::Error> {
-    let refs = get_all_local_refs_git2(raw_repo)?;
-    if refs.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let mut revwalk = raw_repo.revwalk()?;
-    revwalk.set_sorting(Sort::TOPOLOGICAL)?;
-
-    for name in refs.keys() {
-        if !name.starts_with("refs/heads/gto-tag-tmp/") && !name.starts_with("refs/tags/") {
-            revwalk.push_ref(name)?;
-        }
-    }
-    revwalk.hide(root_oid)?;
-
-    let mut commits: Vec<Oid> = revwalk.collect::<Result<Vec<_>, _>>()?;
-    if !commits.contains(&root_oid) {
-        commits.insert(0, root_oid);
-    }
-    Ok(commits)
-}
-
-struct CommitInfo {
+struct MemNode {
     tree_id: Oid,
-    depth: usize,
     cdate: i64,
-    oid: Oid,
+    message: String,
+    parents: Vec<Oid>,
+    children: Vec<Oid>,
+    depth: usize,
+    is_virtual: bool,
 }
 
-fn get_commit_info_git2(
-    raw_repo: &git2::Repository,
-    oid: Oid,
+/// Commit graph held entirely in RAM. All optimization decisions happen
+/// against this graph; real commits are only written at the very end.
+struct InMemoryGraph {
+    nodes: HashMap<Oid, MemNode>,
+    refs: BTreeMap<String, Oid>,
     root_oid: Oid,
-    depth_cache: &mut HashMap<Oid, usize>,
-) -> Result<CommitInfo, git2::Error> {
-    let commit = raw_repo.find_commit(oid)?;
-    let tree_id = commit.tree_id();
-    let cdate = commit.time().seconds();
+    next_virtual_seq: u128,
+    virtual_clock: i64,
+}
 
-    let depth = if oid == root_oid {
-        0
-    } else if let Some(&d) = depth_cache.get(&oid) {
-        d
-    } else {
+impl InMemoryGraph {
+    /// Single read pass: load all refs and every commit reachable from them.
+    fn new(raw_repo: &git2::Repository, root_oid: Oid) -> Result<Self, git2::Error> {
+        let refs = load_all_local_refs(raw_repo)?;
+
+        let mut nodes: HashMap<Oid, MemNode> = HashMap::new();
+        let mut max_cdate = 0i64;
+
         let mut revwalk = raw_repo.revwalk()?;
-        revwalk.push(oid)?;
-        revwalk.hide(root_oid)?;
-        let d = revwalk.count();
-        depth_cache.insert(oid, d);
-        d
-    };
-
-    Ok(CommitInfo {
-        tree_id,
-        depth,
-        cdate,
-        oid,
-    })
-}
-
-fn select_canonicals_git2(
-    raw_repo: &git2::Repository,
-    commits: &[Oid],
-    root_oid: Oid,
-    depth_cache: &mut HashMap<Oid, usize>,
-) -> Result<(HashMap<Oid, Oid>, HashMap<Oid, Vec<Oid>>), git2::Error> {
-    let mut groups: HashMap<Oid, Vec<Oid>> = HashMap::new();
-    let mut commit_info: HashMap<Oid, (usize, i64, Oid)> = HashMap::new();
-
-    for &c in commits {
-        let info = get_commit_info_git2(raw_repo, c, root_oid, depth_cache)?;
-        groups.entry(info.tree_id).or_default().push(c);
-        commit_info.insert(c, (info.depth, info.cdate, info.oid));
-    }
-
-    let mut canonicals = HashMap::new();
-    for (_thash, members) in &groups {
-        let mut sorted_m = members.clone();
-        sorted_m.sort_by(|a, b| {
-            let info_a = &commit_info[a];
-            let info_b = &commit_info[b];
-            info_a.0
-                .cmp(&info_b.0)
-                .then_with(|| info_a.1.cmp(&info_b.1))
-                .then_with(|| info_a.2.cmp(&info_b.2))
-        });
-        let canonical_oid = sorted_m[0];
-        for &m in members {
-            canonicals.insert(m, canonical_oid);
+        revwalk.set_sorting(Sort::TOPOLOGICAL)?;
+        for name in refs.keys() {
+            if name.starts_with("refs/tags/") {
+                if let Ok(obj) = raw_repo.revparse_single(name) {
+                    if let Ok(c) = obj.peel_to_commit() {
+                        revwalk.push(c.id())?;
+                    }
+                }
+            } else {
+                revwalk.push_ref(name)?;
+            }
         }
+
+        let mut walked: Vec<Oid> = Vec::new();
+        for oid in revwalk {
+            let oid = oid?;
+            let commit = raw_repo.find_commit(oid)?;
+            let cdate = commit.time().seconds();
+            max_cdate = max_cdate.max(cdate);
+            nodes.insert(
+                oid,
+                MemNode {
+                    tree_id: commit.tree_id(),
+                    cdate,
+                    message: commit.message().unwrap_or("").to_string(),
+                    parents: commit.parent_ids().collect(),
+                    children: Vec::new(),
+                    depth: 0,
+                    is_virtual: false,
+                },
+            );
+            walked.push(oid);
+        }
+
+        // Depth: number of commits between the root and the commit (root is 0).
+        // The walk is children-first, so process it in reverse so parents are
+        // resolved before children.
+        if let Some(root) = nodes.get_mut(&root_oid) {
+            root.depth = 0;
+        }
+        for &oid in walked.iter().rev() {
+            if oid == root_oid {
+                continue;
+            }
+            let d = nodes[&oid]
+                .parents
+                .iter()
+                .map(|p| nodes.get(p).map(|n| n.depth).unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            nodes.get_mut(&oid).unwrap().depth = d;
+        }
+
+        // Children edges.
+        let child_edges: Vec<(Oid, Oid)> = nodes
+            .iter()
+            .flat_map(|(&oid, n)| n.parents.iter().map(move |&p| (p, oid)))
+            .collect();
+        for (parent, child) in child_edges {
+            if let Some(node) = nodes.get_mut(&parent) {
+                node.children.push(child);
+            }
+        }
+
+        Ok(Self {
+            nodes,
+            refs,
+            root_oid,
+            next_virtual_seq: 0,
+            virtual_clock: max_cdate + 1,
+        })
     }
 
-    Ok((canonicals, groups))
+    /// Allocate a unique synthetic oid for a virtual (not-yet-written) commit.
+    fn new_virtual_oid(&mut self) -> Oid {
+        let mut buf = [0u8; 20];
+        buf[..4].copy_from_slice(&[0x76, 0x69, 0x72, 0x74]); // b"virt"
+        buf[4..].copy_from_slice(&self.next_virtual_seq.to_be_bytes());
+        self.next_virtual_seq += 1;
+        Oid::from_bytes(&buf).unwrap()
+    }
+
+    /// True iff `a` is an ancestor of (or equal to) `b`.
+    fn is_ancestor(&self, a: Oid, b: Oid) -> bool {
+        if a == b {
+            return true;
+        }
+        let mut stack = vec![a];
+        let mut seen = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == b {
+                return true;
+            }
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&n) {
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// True iff walking parents from `tip` reaches the root.
+    fn descends_from_root(&self, tip: Oid) -> bool {
+        if tip == self.root_oid {
+            return true;
+        }
+        let mut stack = vec![tip];
+        let mut seen = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == self.root_oid {
+                return true;
+            }
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&n) {
+                stack.extend(node.parents.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Post-order (parents first) ancestor walk from `n`, excluding the root.
+    fn collect_ancestors(&self, n: Oid, seen: &mut HashSet<Oid>, out: &mut Vec<Oid>) {
+        if n == self.root_oid || !seen.insert(n) {
+            return;
+        }
+        if let Some(node) = self.nodes.get(&n) {
+            for &p in &node.parents {
+                self.collect_ancestors(p, seen, out);
+            }
+        }
+        out.push(n);
+    }
+
+    /// Commits reachable from branch refs (tags and gto-tag-tmp excluded),
+    /// children-first, with the root first. Mirrors the previous revwalk.
+    fn reachable(&self) -> Vec<Oid> {
+        let tips: Vec<Oid> = self
+            .refs
+            .iter()
+            .filter(|(name, _)| {
+                name.starts_with("refs/heads/") && !name.starts_with("refs/heads/gto-tag-tmp/")
+            })
+            .map(|(_, &oid)| oid)
+            .collect();
+        let mut seen = HashSet::new();
+        let mut acc = Vec::new();
+        for tip in tips {
+            self.collect_ancestors(tip, &mut seen, &mut acc);
+        }
+        acc.reverse();
+        let mut result = Vec::with_capacity(acc.len() + 1);
+        result.push(self.root_oid);
+        result.extend(acc);
+        result
+    }
+
+    /// Group commits by tree and pick one canonical per group, ordered by
+    /// (depth, cdate, oid). Same rule as the previous implementation.
+    fn select_canonicals(&self, commits: &[Oid]) -> (HashMap<Oid, Oid>, HashMap<Oid, Vec<Oid>>) {
+        let mut groups: HashMap<Oid, Vec<Oid>> = HashMap::new();
+        let mut info: HashMap<Oid, (usize, i64, Oid)> = HashMap::new();
+        for &c in commits {
+            let node = &self.nodes[&c];
+            groups.entry(node.tree_id).or_default().push(c);
+            info.insert(c, (node.depth, node.cdate, c));
+        }
+        let mut canonicals = HashMap::new();
+        for members in groups.values() {
+            let mut sorted_m = members.clone();
+            sorted_m.sort_by(|a, b| {
+                let ia = &info[a];
+                let ib = &info[b];
+                ia.0
+                    .cmp(&ib.0)
+                    .then_with(|| ia.1.cmp(&ib.1))
+                    .then_with(|| ia.2.cmp(&ib.2))
+            });
+            let canonical = sorted_m[0];
+            for &m in members {
+                canonicals.insert(m, canonical);
+            }
+        }
+        (canonicals, groups)
+    }
+
+    /// Replay the commits strictly between `old_base` and the ref tip (both
+    /// inclusive ends handled like the old revwalk: tip included, old_base
+    /// excluded) on top of `new_base`, creating virtual commits only.
+    fn virtual_rebase(
+        &mut self,
+        refname: &str,
+        old_base: Oid,
+        new_base: Oid,
+        old_to_new: &mut HashMap<Oid, Oid>,
+    ) {
+        let target = self.refs[refname];
+
+        let mut seen = HashSet::new();
+        let mut anc_a = Vec::new();
+        self.collect_ancestors(target, &mut seen, &mut anc_a);
+        let set_a: HashSet<Oid> = anc_a.into_iter().collect();
+
+        let mut seen = HashSet::new();
+        let mut anc_b = Vec::new();
+        self.collect_ancestors(old_base, &mut seen, &mut anc_b);
+        let set_b: HashSet<Oid> = anc_b.into_iter().collect();
+
+        let mut revs: Vec<Oid> = set_a.difference(&set_b).copied().collect();
+        revs.sort_by_key(|r| self.nodes[r].depth);
+
+        let mut curr_parent = new_base;
+        for r in revs {
+            let (tree_id, message) = {
+                let node = &self.nodes[&r];
+                (node.tree_id, node.message.clone())
+            };
+            let v = self.new_virtual_oid();
+            let cdate = self.virtual_clock;
+            self.virtual_clock += 1;
+            let depth = self.nodes[&curr_parent].depth + 1;
+            if let Some(pnode) = self.nodes.get_mut(&curr_parent) {
+                pnode.children.push(v);
+            }
+            self.nodes.insert(
+                v,
+                MemNode {
+                    tree_id,
+                    cdate,
+                    message,
+                    parents: vec![curr_parent],
+                    children: Vec::new(),
+                    depth,
+                    is_virtual: true,
+                },
+            );
+            old_to_new.insert(r, v);
+            curr_parent = v;
+        }
+        self.refs.insert(refname.to_string(), curr_parent);
+    }
 }
 
-fn rebase_branch_onto_git2(
+/// Collect virtual commits reachable from the final refs, parents first.
+fn collect_virtual_commits(
+    oid: Oid,
+    graph: &InMemoryGraph,
+    visited: &mut HashSet<Oid>,
+    order: &mut Vec<Oid>,
+) {
+    if !visited.insert(oid) {
+        return;
+    }
+    let Some(node) = graph.nodes.get(&oid) else {
+        return;
+    };
+    for &p in &node.parents {
+        collect_virtual_commits(p, graph, visited, order);
+    }
+    if node.is_virtual {
+        order.push(oid);
+    }
+}
+
+/// Single deferred write pass: create every still-reachable virtual commit in
+/// topological order, then update every remaining ref once.
+fn materialize_commits_and_refs(
     raw_repo: &git2::Repository,
-    target_branch_ref: &str,
-    old_base_oid: Oid,
-    new_base_oid: Oid,
-    old_to_new: &mut HashMap<Oid, Oid>,
+    graph: &InMemoryGraph,
+    final_refs: &BTreeMap<String, Oid>,
 ) -> Result<(), git2::Error> {
-    let target_oid = raw_repo
-        .find_reference(target_branch_ref)?
-        .peel_to_commit()?
-        .id();
-
-    let mut revwalk = raw_repo.revwalk()?;
-    revwalk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)?;
-    revwalk.push(target_oid)?;
-    revwalk.hide(old_base_oid)?;
-
-    let revs: Vec<Oid> = revwalk.collect::<Result<Vec<_>, _>>()?;
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    for tip in final_refs.values() {
+        collect_virtual_commits(*tip, graph, &mut visited, &mut order);
+    }
 
     let signature = raw_repo.signature()?;
-    let mut curr_parent_oid = new_base_oid;
-
-    for r_oid in revs {
-        let commit = raw_repo.find_commit(r_oid)?;
-        let tree = commit.tree()?;
-        let msg = commit.message().unwrap_or("");
-        let parent_commit = raw_repo.find_commit(curr_parent_oid)?;
-
-        curr_parent_oid = raw_repo.commit(
+    let mut created: HashMap<Oid, Oid> = HashMap::new();
+    for &v in &order {
+        let node = &graph.nodes[&v];
+        let parents: Vec<Oid> = node
+            .parents
+            .iter()
+            .map(|p| created.get(p).copied().unwrap_or(*p))
+            .collect();
+        let parent_commits: Vec<git2::Commit> = parents
+            .iter()
+            .map(|p| raw_repo.find_commit(*p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+        let tree = raw_repo.find_tree(node.tree_id)?;
+        let real = raw_repo.commit(
             None,
             &signature,
             &signature,
-            msg,
+            &node.message,
             &tree,
-            &[&parent_commit],
+            &parent_refs,
         )?;
-        old_to_new.insert(r_oid, curr_parent_oid);
+        created.insert(v, real);
     }
 
-    raw_repo.reference(target_branch_ref, curr_parent_oid, true, "rebase_branch_onto")?;
+    for (name, &tip) in final_refs {
+        let real = created.get(&tip).copied().unwrap_or(tip);
+        raw_repo.reference(name, real, true, "optimize_history")?;
+    }
     Ok(())
 }
 
@@ -190,9 +387,6 @@ pub fn optimize_history(
     move_tags: bool,
     max_rounds: Option<usize>,
 ) -> EyreExitOr<()> {
-
-
-
     let repo = Repo::from_current_dir()?;
     let raw_repo = repo.raw_repo();
 
@@ -224,38 +418,41 @@ pub fn optimize_history(
     };
     let root_oid = root_obj.id();
 
-    // Filter local refs to only those that descend from root_oid
-    let raw_all_refs = get_all_local_refs_git2(raw_repo)?;
-    let all_refs: BTreeMap<String, Oid> = raw_all_refs
-        .into_iter()
-        .filter(|(_, refoid)| is_ancestor_git2(raw_repo, root_oid, *refoid))
-        .collect();
+    // Load the whole commit graph into memory in a single read pass.
+    let mut graph = InMemoryGraph::new(&raw_repo, root_oid)?;
 
-    if all_refs.is_empty() {
+    // Keep only refs that descend from root.
+    let keep_refs: HashSet<Oid> = graph
+        .refs
+        .values()
+        .copied()
+        .filter(|&tip| graph.descends_from_root(tip))
+        .collect();
+    graph.refs.retain(|_, tip| keep_refs.contains(tip));
+    if graph.refs.is_empty() {
         eprintln!("error: no local refs descend from root {root_ref_str} ({root_oid})");
         return Ok(Err(ExitCode(1)));
     }
 
     println!("Optimizing sub-tree history above root {root_ref_str} ({root_oid})...");
 
-    let mut depth_cache = HashMap::new();
-
-    let initial_refs = all_refs.clone();
-    let initial_tags: BTreeMap<String, Oid> = initial_refs
+    let initial_tags: BTreeMap<String, Oid> = graph
+        .refs
         .iter()
         .filter(|(r, _)| r.starts_with("refs/tags/"))
         .map(|(r, &o)| (r.clone(), o))
         .collect();
 
-    let initial_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
-    let (initial_canonicals, initial_tree_groups) = select_canonicals_git2(raw_repo, &initial_commits, root_oid, &mut depth_cache)?;
-
     let mut dup_targets = HashMap::new();
-    for (_thash, members) in &initial_tree_groups {
-        if members.len() > 1 {
-            for &m in members {
-                if m != initial_canonicals[&m] {
-                    dup_targets.insert(m, initial_canonicals[&m]);
+    {
+        let initial_commits = graph.reachable();
+        let (initial_canonicals, initial_tree_groups) = graph.select_canonicals(&initial_commits);
+        for members in initial_tree_groups.values() {
+            if members.len() > 1 {
+                for &m in members {
+                    if m != initial_canonicals[&m] {
+                        dup_targets.insert(m, initial_canonicals[&m]);
+                    }
                 }
             }
         }
@@ -271,35 +468,29 @@ pub fn optimize_history(
         println!("Round {round_num}: enumerating commits and canonical groups...");
         if max_rounds_num > 0 && round_num > max_rounds_num {
             eprintln!("error: exceeded max rounds ({max_rounds_num})");
-            if !dry_run {
-                for (rname, &roid) in &initial_refs {
-                    let _ = raw_repo.reference(rname, roid, true, "rollback");
-                }
-            }
             return Ok(Err(ExitCode(1)));
         }
 
-        let commits = get_reachable_commits_git2(raw_repo, root_oid)?;
+        let commits = graph.reachable();
         let proc_commits: Vec<Oid> = commits.into_iter().filter(|&c| c != root_oid).collect();
         if proc_commits.is_empty() {
             println!("No reachable commits to optimize.");
             break;
         }
 
-        let reachable = get_reachable_commits_git2(raw_repo, root_oid)?;
-        let (round_cans, tree_groups) = select_canonicals_git2(raw_repo, &reachable, root_oid, &mut depth_cache)?;
+        let reachable = graph.reachable();
+        let (round_cans, tree_groups) = graph.select_canonicals(&reachable);
 
         // Step 0: branch the duplicates that lack a branch ref
-        let current_refs = get_all_local_refs_git2(raw_repo)?;
         let mut head_refs: HashMap<Oid, Vec<String>> = HashMap::new();
-        for (rname, &roid) in &current_refs {
+        for (rname, &roid) in &graph.refs {
             if rname.starts_with("refs/heads/") {
                 head_refs.entry(roid).or_default().push(rname.clone());
             }
         }
 
         let mut added_temp = false;
-        for (_thash, members) in &tree_groups {
+        for members in tree_groups.values() {
             if members.len() > 1 {
                 for &m in members {
                     if m == root_oid {
@@ -309,8 +500,7 @@ pub fn optimize_history(
                         let temp_ref = format!("refs/heads/gto/{m}");
                         println!("Step 0: creating temporary branch {temp_ref} for duplicate commit {m}");
                         if !dry_run {
-                            let commit_obj = raw_repo.find_commit(m)?;
-                            let _ = raw_repo.branch(&format!("gto/{m}"), &commit_obj, false);
+                            graph.refs.insert(temp_ref.clone(), m);
                             added_temp = true;
                         }
                         plan_actions.push(format!("Step 0: create temp branch {temp_ref} for {m}"));
@@ -327,7 +517,7 @@ pub fn optimize_history(
         loop {
             p1_pass += 1;
             let mut p1_changed = false;
-            let current_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
+            let current_commits = graph.reachable();
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
 
             for &c_prime in &proc_c {
@@ -337,29 +527,31 @@ pub fn optimize_history(
                 if c_prime == canonical_c {
                     continue;
                 }
-                if !is_ancestor_git2(raw_repo, canonical_c, c_prime) {
+                if !graph.is_ancestor(canonical_c, c_prime) {
                     let keep_ref = format!("refs/heads/gto-keep/{c_prime}");
-                    if !dry_run && raw_repo.find_reference(&keep_ref).is_err() {
-                        let commit_obj = raw_repo.find_commit(c_prime)?;
-                        let _ = raw_repo.branch(&format!("gto-keep/{c_prime}"), &commit_obj, false);
+                    if !dry_run && !graph.refs.contains_key(&keep_ref) {
+                        graph.refs.insert(keep_ref.clone(), c_prime);
                     }
                     plan_actions.push(format!("Pattern 1: preserve chain {keep_ref} at {c_prime}"));
 
-                    let branch_refs = get_all_local_refs_git2(raw_repo)?;
-                    for (rname, &roid) in &branch_refs {
-                        if !rname.starts_with("refs/heads/")
-                            || rname.starts_with("refs/heads/gto-keep/")
-                            || rname.starts_with("refs/heads/gto/")
-                        {
-                            continue;
-                        }
-                        if is_ancestor_git2(raw_repo, c_prime, roid) {
-                            if c_prime != roid {
+                    let branch_refs: Vec<(String, Oid)> = graph
+                        .refs
+                        .iter()
+                        .filter(|(rname, _)| {
+                            rname.starts_with("refs/heads/")
+                                && !rname.starts_with("refs/heads/gto-keep/")
+                                && !rname.starts_with("refs/heads/gto/")
+                        })
+                        .map(|(r, &o)| (r.clone(), o))
+                        .collect();
+                    for (rname, roid) in &branch_refs {
+                        if graph.is_ancestor(c_prime, *roid) {
+                            if c_prime != *roid {
                                 println!("Round {round_num} Pass 1 (pass {p1_pass}): rebasing {rname} onto canonical {canonical_c}");
                                 plan_actions.push(format!("Pattern 1: rebase {rname} onto {canonical_c} (from {c_prime})"));
 
                                 if !dry_run {
-                                    let _ = rebase_branch_onto_git2(raw_repo, rname, c_prime, canonical_c, &mut old_to_new);
+                                    graph.virtual_rebase(rname, c_prime, canonical_c, &mut old_to_new);
                                     p1_changed = true;
                                     changed_in_round = true;
                                 }
@@ -378,7 +570,7 @@ pub fn optimize_history(
         loop {
             p2_pass += 1;
             let mut p2_changed = false;
-            let current_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
+            let current_commits = graph.reachable();
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
 
             for &y in &proc_c {
@@ -388,29 +580,31 @@ pub fn optimize_history(
                 if y == canonical_c {
                     continue;
                 }
-                if is_ancestor_git2(raw_repo, canonical_c, y) {
+                if graph.is_ancestor(canonical_c, y) {
                     let keep_ref = format!("refs/heads/gto-keep/{y}");
-                    if !dry_run && raw_repo.find_reference(&keep_ref).is_err() {
-                        let commit_obj = raw_repo.find_commit(y)?;
-                        let _ = raw_repo.branch(&format!("gto-keep/{y}"), &commit_obj, false);
+                    if !dry_run && !graph.refs.contains_key(&keep_ref) {
+                        graph.refs.insert(keep_ref.clone(), y);
                     }
                     plan_actions.push(format!("Pattern 2: preserve chain {keep_ref} at {y}"));
 
-                    let branch_refs = get_all_local_refs_git2(raw_repo)?;
-                    for (rname, &roid) in &branch_refs {
-                        if !rname.starts_with("refs/heads/")
-                            || rname.starts_with("refs/heads/gto-keep/")
-                            || rname.starts_with("refs/heads/gto/")
-                        {
-                            continue;
-                        }
-                        if is_ancestor_git2(raw_repo, y, roid) {
-                            if y != roid {
+                    let branch_refs: Vec<(String, Oid)> = graph
+                        .refs
+                        .iter()
+                        .filter(|(rname, _)| {
+                            rname.starts_with("refs/heads/")
+                                && !rname.starts_with("refs/heads/gto-keep/")
+                                && !rname.starts_with("refs/heads/gto/")
+                        })
+                        .map(|(r, &o)| (r.clone(), o))
+                        .collect();
+                    for (rname, roid) in &branch_refs {
+                        if graph.is_ancestor(y, *roid) {
+                            if y != *roid {
                                 println!("Round {round_num} Pass 2 (pass {p2_pass}): shallowing {rname} onto canonical {canonical_c}");
                                 plan_actions.push(format!("Pattern 2: rebase {rname} onto {canonical_c} (from {y})"));
 
                                 if !dry_run {
-                                    let _ = rebase_branch_onto_git2(raw_repo, rname, y, canonical_c, &mut old_to_new);
+                                    graph.virtual_rebase(rname, y, canonical_c, &mut old_to_new);
                                     p2_changed = true;
                                     changed_in_round = true;
                                 }
@@ -435,7 +629,6 @@ pub fn optimize_history(
         if move_tags {
             println!("Updating tags to point to canonical commits...");
             for (tag_ref, &tag_oid) in &initial_tags {
-                let tname = tag_ref.trim_start_matches("refs/tags/");
                 let mut cur = tag_oid;
                 while let Some(&next) = old_to_new.get(&cur) {
                     if next == cur {
@@ -450,7 +643,7 @@ pub fn optimize_history(
                 } else {
                     continue;
                 };
-                let _ = raw_repo.tag_lightweight(tname, &raw_repo.find_object(final_target, None)?, true);
+                graph.refs.insert(tag_ref.clone(), final_target);
             }
         } else {
             for (tag_ref, &tag_oid) in &initial_tags {
@@ -466,25 +659,21 @@ pub fn optimize_history(
         for act in &plan_actions {
             println!("  {act}");
         }
-        for (rname, &roid) in &initial_refs {
-            let _ = raw_repo.reference(rname, roid, true, "rollback_dry_run");
-        }
     }
 
-    // Delete temporary branches refs/heads/gto/* (excluding gto-keep)
+    // Materialize: drop gto/* temp refs, create any virtual commits that are
+    // still reachable, and write every remaining ref in a single pass.
     if !dry_run {
         println!("Cleaning up temporary branches...");
-        if let Ok(references) = raw_repo.references() {
-            for reference in references.flatten() {
-                if let Some(name) = reference.name() {
-                    if name.starts_with("refs/heads/gto/") && !name.starts_with("refs/heads/gto-keep/") {
-                        if let Ok(mut branch) = raw_repo.find_branch(name.trim_start_matches("refs/heads/"), git2::BranchType::Local) {
-                            let _ = branch.delete();
-                        }
-                    }
-                }
-            }
-        }
+        let final_refs: BTreeMap<String, Oid> = graph
+            .refs
+            .iter()
+            .filter(|(rname, _)| {
+                !(rname.starts_with("refs/heads/gto/") && !rname.starts_with("refs/heads/gto-keep/"))
+            })
+            .map(|(r, &o)| (r.clone(), o))
+            .collect();
+        materialize_commits_and_refs(&raw_repo, &graph, &final_refs)?;
     }
 
     println!("Finished sub-tree history optimization.");
