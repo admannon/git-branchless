@@ -2,6 +2,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+
+
+
 use git_branchless_opts::Revset;
 use lib::core::effects::Effects;
 use lib::git::git2::{Oid, Sort};
@@ -185,10 +188,15 @@ pub fn optimize_history(
     move_tags: bool,
     max_rounds: Option<usize>,
 ) -> EyreExitOr<()> {
+
+
+
     let repo = Repo::from_current_dir()?;
     let raw_repo = repo.raw_repo();
 
     let root_ref_str = root.or(base).map(|r| r.0).unwrap_or_else(|| "HEAD".to_string());
+
+    println!("Performing pre-flight checks...");
 
     // Pre-flight check 1: clean worktree
     let mut status_options = git2::StatusOptions::new();
@@ -226,6 +234,8 @@ pub fn optimize_history(
         return Ok(Err(ExitCode(1)));
     }
 
+    println!("Optimizing sub-tree history above root {root_ref_str} ({root_oid})...");
+
     let mut depth_cache = HashMap::new();
 
     let initial_refs = all_refs.clone();
@@ -255,8 +265,9 @@ pub fn optimize_history(
     let mut round_num = 0;
     loop {
         round_num += 1;
+        println!("Round {round_num}: enumerating commits and canonical groups...");
         if max_rounds_num > 0 && round_num > max_rounds_num {
-            eprintln!("error: exceeded max rounds");
+            eprintln!("error: exceeded max rounds ({max_rounds_num})");
             if !dry_run {
                 for (rname, &roid) in &initial_refs {
                     let _ = raw_repo.reference(rname, roid, true, "rollback");
@@ -268,6 +279,7 @@ pub fn optimize_history(
         let commits = get_reachable_commits_git2(raw_repo, root_oid)?;
         let proc_commits: Vec<Oid> = commits.into_iter().filter(|&c| c != root_oid).collect();
         if proc_commits.is_empty() {
+            println!("No reachable commits to optimize.");
             break;
         }
 
@@ -292,6 +304,7 @@ pub fn optimize_history(
                     }
                     if !head_refs.contains_key(&m) || head_refs[&m].is_empty() {
                         let temp_ref = format!("refs/heads/gto/{m}");
+                        println!("Step 0: creating temporary branch {temp_ref} for duplicate commit {m}");
                         if !dry_run {
                             let commit_obj = raw_repo.find_commit(m)?;
                             let _ = raw_repo.branch(&format!("gto/{m}"), &commit_obj, false);
@@ -307,7 +320,9 @@ pub fn optimize_history(
         let mut changed_in_round = false;
 
         // Pattern 1 loop to fixpoint
+        let mut p1_pass = 0;
         loop {
+            p1_pass += 1;
             let mut p1_changed = false;
             let current_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
@@ -333,6 +348,7 @@ pub fn optimize_history(
                         }
                         if is_ancestor_git2(raw_repo, c_prime, roid) {
                             if c_prime != roid {
+                                println!("Round {round_num} Pass 1 (pass {p1_pass}): rebasing {rname} onto canonical {canonical_c}");
                                 plan_actions.push(format!("Pattern 1: rebase {rname} onto {canonical_c} (from {c_prime})"));
 
                                 if !dry_run {
@@ -351,7 +367,9 @@ pub fn optimize_history(
         }
 
         // Pattern 2 loop to fixpoint
+        let mut p2_pass = 0;
         loop {
+            p2_pass += 1;
             let mut p2_changed = false;
             let current_commits = get_reachable_commits_git2(raw_repo, root_oid)?;
             let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
@@ -377,6 +395,7 @@ pub fn optimize_history(
                         }
                         if is_ancestor_git2(raw_repo, y, roid) {
                             if y != roid {
+                                println!("Round {round_num} Pass 2 (pass {p2_pass}): shallowing {rname} onto canonical {canonical_c}");
                                 plan_actions.push(format!("Pattern 2: rebase {rname} onto {canonical_c} (from {y})"));
 
                                 if !dry_run {
@@ -395,6 +414,7 @@ pub fn optimize_history(
         }
 
         if !changed_in_round && !added_temp {
+            println!("Fixpoint reached in round {round_num}. Optimization complete.");
             break;
         }
     }
@@ -402,6 +422,7 @@ pub fn optimize_history(
     // Tag handling
     if !dry_run {
         if move_tags {
+            println!("Updating tags to point to canonical commits...");
             for (tag_ref, &tag_oid) in &initial_tags {
                 let tname = tag_ref.trim_start_matches("refs/tags/");
                 if let Some(&new_target) = dup_targets.get(&tag_oid) {
@@ -429,6 +450,7 @@ pub fn optimize_history(
 
     // Delete temporary branches refs/heads/gto/* (excluding gto-keep)
     if !dry_run {
+        println!("Cleaning up temporary branches...");
         if let Ok(references) = raw_repo.references() {
             for reference in references.flatten() {
                 if let Some(name) = reference.name() {
@@ -442,5 +464,6 @@ pub fn optimize_history(
         }
     }
 
+    println!("Finished sub-tree history optimization.");
     Ok(Ok(()))
 }
