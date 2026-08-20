@@ -405,11 +405,35 @@ fixture13_merge() {
   common_asserts "$A"
 }
 
+fixture14_nested_canonical() {
+  echo "fixture 14: nested canonical lines (deep chain of duplicate groups)"
+  local d A c1 d3 c2 d2 c y1 tip out trees_before
+  d=$(newrepo); cd "$d"
+  A=$(commit "$(mktree1 r R)" "A")
+  c1=$(commit "$(mktree1 t T1)" "c1" "$A")     # canonical of T1 (shallowest)
+  d3=$(commit "$(mktree1 t T1)" "d3" "$c1")    # dup of c1
+  c2=$(commit "$(mktree1 u T2)" "c2" "$d3")    # canonical of T2
+  d2=$(commit "$(mktree1 u T2)" "d2" "$c2")    # dup of c2
+  c=$(commit "$(mktree1 v T3)" "c" "$d2")      # canonical of T3
+  y1=$(commit "$(mktree1 v T3)" "y1" "$c")     # dup of c
+  tip=$(commit "$(mktree1 w TX)" "tip" "$y1")  # unique tip
+  git checkout -q -b branch2 "$tip"
+
+  trees_before=$(tree_set "$A")
+  out=$($OPT "$A" 2>&1) || die "fixture 14 optimize failed"
+  check "nested: exactly 1 real rebase" test "$(printf "%s\n" "$out" | grep -cE 'Pass [0-9]+ \(pass [0-9]+\): (rebasing|shallowing) refs/heads/branch2')" = 1
+  check "nested: exactly 2 rounds" test "$(printf "%s\n" "$out" | grep -c '^Round [0-9]*:')" = 2
+  check "nested: branch2 tip tree preserved" test "$(git rev-parse "branch2^{tree}")" = "$(git rev-parse "$tip^{tree}")"
+  check "nested: branch2 now branches from shallowest canonical c1" is_ancestor "$c1" "$(git rev-parse branch2)"
+  check "nested: intermediate dups anchored by gto-keep" bash -c 'git for-each-ref --format=x refs/heads/gto-keep | grep -q .'
+  common_asserts "$A"
+}
+
 for f in \
   fixture1_pattern1 fixture2_pattern2 fixture3_consecutive fixture4_tipdup \
   fixture5_tags fixture6_dirty fixture7_nonancestor fixture8_dryrun \
   fixture9_rootdup fixture10_combined fixture11_zip fixture12_zip100 \
-  fixture13_merge; do
+  fixture13_merge fixture14_nested_canonical; do
   "$f" || die "fixture $f failed"
 done
 

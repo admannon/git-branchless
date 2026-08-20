@@ -10,13 +10,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use git_branchless_opts::Revset;
 use lib::core::effects::Effects;
 use lib::git::git2::{Oid, Sort};
-use lib::git::{git2, GitRunInfo, Repo};
+use lib::git::{GitRunInfo, Repo, git2};
 use lib::util::{ExitCode, EyreExitOr};
 
 /// Load every local branch and tag ref as a name -> commit oid map.
-fn load_all_local_refs(
-    raw_repo: &git2::Repository,
-) -> Result<BTreeMap<String, Oid>, git2::Error> {
+fn load_all_local_refs(raw_repo: &git2::Repository) -> Result<BTreeMap<String, Oid>, git2::Error> {
     let mut map = BTreeMap::new();
     let references = raw_repo.references()?;
     for reference in references {
@@ -259,8 +257,7 @@ impl InMemoryGraph {
             sorted_m.sort_by(|a, b| {
                 let ia = &info[a];
                 let ib = &info[b];
-                ia.0
-                    .cmp(&ib.0)
+                ia.0.cmp(&ib.0)
                     .then_with(|| ia.1.cmp(&ib.1))
                     .then_with(|| ia.2.cmp(&ib.2))
             });
@@ -354,6 +351,48 @@ impl InMemoryGraph {
             curr_parent = v;
         }
         self.refs.insert(refname.to_string(), curr_parent);
+    }
+
+    /// Resolve the effective rebase target for a canonical commit: repeatedly
+    /// jump to the canonical of the deepest non-canonical duplicate on its
+    /// ancestry until the ancestry is clean. This collapses the per-pass climb
+    /// of the previous algorithm into a single step, so a branch is replayed
+    /// onto the final canonical once instead of being re-replayed through every
+    /// intermediate canonical line (which created duplicate-tree virtuals and
+    /// kept re-triggering new rounds). Depth strictly decreases on every jump,
+    /// so the loop always terminates.
+    fn resolve_target(&self, mut cur: Oid, round_cans: &HashMap<Oid, Oid>) -> Oid {
+        loop {
+            let mut best: Option<(usize, Oid)> = None;
+            let mut seen = HashSet::new();
+            seen.insert(self.root_oid);
+            seen.insert(cur);
+            let mut stack: Vec<Oid> = self
+                .nodes
+                .get(&cur)
+                .map(|n| n.parents.clone())
+                .unwrap_or_default();
+            while let Some(a) = stack.pop() {
+                if !seen.insert(a) {
+                    continue;
+                }
+                if let Some(&ca) = round_cans.get(&a) {
+                    if ca != a {
+                        let depth = self.nodes[&a].depth;
+                        if best.map_or(true, |(bd, _)| depth > bd) {
+                            best = Some((depth, a));
+                        }
+                    }
+                }
+                if let Some(node) = self.nodes.get(&a) {
+                    stack.extend(node.parents.iter().copied());
+                }
+            }
+            match best {
+                Some((_, d)) => cur = round_cans[&d],
+                None => return cur,
+            }
+        }
     }
 
     /// Commit -> branches (ref name, tip) whose ancestry contains it, for
@@ -469,7 +508,10 @@ pub fn optimize_history(
     let repo = Repo::from_current_dir()?;
     let raw_repo = repo.raw_repo();
 
-    let root_ref_str = root.or(base).map(|r| r.0).unwrap_or_else(|| "HEAD".to_string());
+    let root_ref_str = root
+        .or(base)
+        .map(|r| r.0)
+        .unwrap_or_else(|| "HEAD".to_string());
 
     println!("Performing pre-flight checks...");
 
@@ -551,7 +593,11 @@ pub fn optimize_history(
         }
 
         let reachable = graph.reachable();
-        let proc_commits: Vec<Oid> = reachable.iter().copied().filter(|&c| c != root_oid).collect();
+        let proc_commits: Vec<Oid> = reachable
+            .iter()
+            .copied()
+            .filter(|&c| c != root_oid)
+            .collect();
         if proc_commits.is_empty() {
             println!("No reachable commits to optimize.");
             break;
@@ -576,7 +622,9 @@ pub fn optimize_history(
                     }
                     if !head_refs.contains_key(&m) || head_refs[&m].is_empty() {
                         let temp_ref = format!("refs/heads/gto/{m}");
-                        println!("Step 0: creating temporary branch {temp_ref} for duplicate commit {m}");
+                        println!(
+                            "Step 0: creating temporary branch {temp_ref} for duplicate commit {m}"
+                        );
                         if !dry_run {
                             graph.refs.insert(temp_ref.clone(), m);
                             added_temp = true;
@@ -596,7 +644,10 @@ pub fn optimize_history(
             p1_pass += 1;
             let mut p1_changed = false;
             let current_commits = graph.reachable();
-            let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
+            let proc_c: Vec<Oid> = current_commits
+                .into_iter()
+                .filter(|&c| c != root_oid)
+                .collect();
             let descending = graph.descending_branches();
             let mut rebased_this_pass: HashSet<String> = HashSet::new();
 
@@ -617,11 +668,16 @@ pub fn optimize_history(
                     if let Some(branch_list) = descending.get(&c_prime) {
                         for (rname, roid) in branch_list {
                             if c_prime != *roid && !rebased_this_pass.contains(rname) {
-                                println!("Round {round_num} Pass 1 (pass {p1_pass}): rebasing {rname} onto canonical {canonical_c}");
-                                plan_actions.push(format!("Pattern 1: rebase {rname} onto {canonical_c} (from {c_prime})"));
+                                let target = graph.resolve_target(canonical_c, &round_cans);
+                                println!(
+                                    "Round {round_num} Pass 1 (pass {p1_pass}): rebasing {rname} onto canonical {target}"
+                                );
+                                plan_actions.push(format!(
+                                    "Pattern 1: rebase {rname} onto {target} (from {c_prime})"
+                                ));
 
                                 if !dry_run {
-                                    graph.virtual_rebase(rname, c_prime, canonical_c, &mut old_to_new);
+                                    graph.virtual_rebase(rname, c_prime, target, &mut old_to_new);
                                     rebased_this_pass.insert(rname.clone());
                                     p1_changed = true;
                                     changed_in_round = true;
@@ -642,7 +698,10 @@ pub fn optimize_history(
             p2_pass += 1;
             let mut p2_changed = false;
             let current_commits = graph.reachable();
-            let proc_c: Vec<Oid> = current_commits.into_iter().filter(|&c| c != root_oid).collect();
+            let proc_c: Vec<Oid> = current_commits
+                .into_iter()
+                .filter(|&c| c != root_oid)
+                .collect();
             let descending = graph.descending_branches();
             let mut rebased_this_pass: HashSet<String> = HashSet::new();
 
@@ -663,11 +722,16 @@ pub fn optimize_history(
                     if let Some(branch_list) = descending.get(&y) {
                         for (rname, roid) in branch_list {
                             if y != *roid && !rebased_this_pass.contains(rname) {
-                                println!("Round {round_num} Pass 2 (pass {p2_pass}): shallowing {rname} onto canonical {canonical_c}");
-                                plan_actions.push(format!("Pattern 2: rebase {rname} onto {canonical_c} (from {y})"));
+                                let target = graph.resolve_target(canonical_c, &round_cans);
+                                println!(
+                                    "Round {round_num} Pass 2 (pass {p2_pass}): shallowing {rname} onto canonical {target}"
+                                );
+                                plan_actions.push(format!(
+                                    "Pattern 2: rebase {rname} onto {target} (from {y})"
+                                ));
 
                                 if !dry_run {
-                                    graph.virtual_rebase(rname, y, canonical_c, &mut old_to_new);
+                                    graph.virtual_rebase(rname, y, target, &mut old_to_new);
                                     rebased_this_pass.insert(rname.clone());
                                     p2_changed = true;
                                     changed_in_round = true;
@@ -733,7 +797,8 @@ pub fn optimize_history(
             .refs
             .iter()
             .filter(|(rname, _)| {
-                !(rname.starts_with("refs/heads/gto/") && !rname.starts_with("refs/heads/gto-keep/"))
+                !(rname.starts_with("refs/heads/gto/")
+                    && !rname.starts_with("refs/heads/gto-keep/"))
             })
             .map(|(r, &o)| (r.clone(), o))
             .collect();
